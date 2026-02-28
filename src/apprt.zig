@@ -19,6 +19,7 @@ pub const none = @import("apprt/none.zig");
 pub const browser = @import("apprt/browser.zig");
 pub const embedded = @import("apprt/embedded.zig");
 pub const surface = @import("apprt/surface.zig");
+pub const windows = @import("apprt/windows.zig");
 
 pub const Action = action.Action;
 pub const Runtime = @import("apprt/runtime.zig").Runtime;
@@ -43,6 +44,7 @@ pub const runtime = switch (build_config.artifact) {
     .exe => switch (build_config.app_runtime) {
         .none => none,
         .gtk => gtk,
+        .windows => windows,
     },
     .lib => embedded,
     .wasm_module => browser,
