@@ -3,6 +3,7 @@
 //! help, docs, website, etc.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config/Config.zig");
 const Action = @import("cli/ghostty.zig").Action;
 const KeybindAction = @import("input/Binding.zig").Action;
@@ -23,7 +24,10 @@ pub fn main() !void {
     try genConfig(alloc, writer);
     try genActions(alloc, writer);
     try genKeybindActions(alloc, writer);
-    try stdout.end();
+    stdout.end() catch |err| switch (err) {
+        error.FileTooBig => {}, // Windows: ftruncate not supported on stdout pipe
+        else => return err,
+    };
 }
 
 fn genConfig(alloc: std.mem.Allocator, writer: *std.Io.Writer) !void {
