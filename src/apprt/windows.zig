@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const input = @import("../input.zig");
+const keycodes = @import("../input/keycodes.zig");
 const internal_os = @import("../os/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreSurface = @import("../Surface.zig");
@@ -119,7 +120,33 @@ const win32 = struct {
     const WM_DESTROY = 0x0002;
     const WM_SIZE = 0x0005;
     const WM_PAINT = 0x000F;
+    const WM_CLOSE = 0x0010;
+    const WM_KEYDOWN = 0x0100;
+    const WM_KEYUP = 0x0101;
+    const WM_CHAR = 0x0102;
+    const WM_SYSKEYDOWN = 0x0104;
+    const WM_SYSKEYUP = 0x0105;
+    const WM_SYSCHAR = 0x0106;
     const WM_USER = 0x0400;
+
+    // PeekMessage constants
+    const PM_NOREMOVE = 0x0000;
+    const PM_REMOVE = 0x0001;
+
+    // Virtual key constants
+    const VK_SHIFT = 0x10;
+    const VK_CONTROL = 0x11;
+    const VK_MENU = 0x12; // Alt
+    const VK_CAPITAL = 0x14; // Caps Lock
+    const VK_NUMLOCK = 0x90;
+    const VK_LSHIFT = 0xA0;
+    const VK_RSHIFT = 0xA1;
+    const VK_LCONTROL = 0xA2;
+    const VK_RCONTROL = 0xA3;
+    const VK_LMENU = 0xA4;
+    const VK_RMENU = 0xA5;
+    const VK_LWIN = 0x5B;
+    const VK_RWIN = 0x5C;
 
     // Window style constants
     const WS_OVERLAPPEDWINDOW = 0x00CF0000;
@@ -189,6 +216,9 @@ const win32 = struct {
     extern "user32" fn GetClientRect(hwnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
     extern "user32" fn SetWindowTextW(hwnd: HWND, lpString: LPCWSTR) callconv(.winapi) BOOL;
 
+    extern "user32" fn GetKeyState(nVirtKey: i32) callconv(.winapi) i16;
+    extern "user32" fn MapVirtualKeyW(uCode: u32, uMapType: u32) callconv(.winapi) u32;
+
     // kernel32
     extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.winapi) ?HINSTANCE;
     extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
@@ -235,6 +265,52 @@ const pfd = win32.PIXELFORMATDESCRIPTOR{
     .dwVisibleMask = 0,
     .dwDamageMask = 0,
 };
+
+// ---------------------------------------------------------------
+// Keyboard helpers
+// ---------------------------------------------------------------
+
+/// Extract the scancode from WM_KEYDOWN/WM_KEYUP lParam.
+/// Returns a value compatible with keycodes.zig "Win" column.
+/// Bits 16-23 = scancode, bit 24 = extended key flag.
+fn scancodeFromLparam(lParam: win32.LPARAM) u16 {
+    const lparam: u32 = @bitCast(@as(i32, @truncate(lParam)));
+    const scancode: u16 = @truncate((lparam >> 16) & 0xFF);
+    const extended: u16 = if (lparam & (1 << 24) != 0) 0xe000 else 0;
+    return scancode | extended;
+}
+
+/// Map a Windows scancode to a Ghostty input.Key.
+fn keyFromScancode(scancode: u16) input.Key {
+    for (keycodes.entries) |entry| {
+        if (entry.native == scancode) return entry.key;
+    }
+    return .unidentified;
+}
+
+/// Read the current keyboard modifier state from Win32.
+fn getModifiers() input.Mods {
+    const key_pressed = struct {
+        fn check(vk: i32) bool {
+            return (win32.GetKeyState(vk) & @as(i16, -128)) != 0; // high bit set
+        }
+    }.check;
+
+    return .{
+        .shift = key_pressed(win32.VK_SHIFT),
+        .ctrl = key_pressed(win32.VK_CONTROL),
+        .alt = key_pressed(win32.VK_MENU),
+        .super = key_pressed(win32.VK_LWIN) or key_pressed(win32.VK_RWIN),
+        .caps_lock = (win32.GetKeyState(win32.VK_CAPITAL) & 1) != 0,
+        .num_lock = (win32.GetKeyState(win32.VK_NUMLOCK) & 1) != 0,
+    };
+}
+
+/// Encode a UTF-16 code unit (from WM_CHAR wParam) to UTF-8.
+fn utf16ToUtf8(codepoint: u21, buf: *[4]u8) []const u8 {
+    const len = std.unicode.utf8Encode(codepoint, buf) catch return &.{};
+    return buf[0..len];
+}
 
 // ---------------------------------------------------------------
 // App
@@ -485,13 +561,24 @@ pub const App = struct {
         };
 
         switch (msg) {
+            win32.WM_CLOSE => {
+                // Let the surface close cleanly instead of immediate destroy
+                if (app) |a| {
+                    if (a.surface) |*s| {
+                        if (s.core_surface) |*cs| {
+                            cs.close();
+                            return 0;
+                        }
+                    }
+                }
+                _ = win32.DestroyWindow(hwnd);
+                return 0;
+            },
             win32.WM_DESTROY => {
                 win32.PostQuitMessage(0);
                 return 0;
             },
             win32.WM_PAINT => {
-                // The renderer thread handles all GL drawing via SwapBuffers.
-                // We just validate the rect to prevent WM_PAINT storms.
                 _ = win32.ValidateRect(hwnd, null);
                 return 0;
             },
@@ -511,8 +598,97 @@ pub const App = struct {
                 }
                 return 0;
             },
+            win32.WM_KEYDOWN,
+            win32.WM_SYSKEYDOWN,
+            => {
+                if (app) |a| {
+                    if (a.surface) |*s| {
+                        const repeat = (lParam & (1 << 30)) != 0;
+                        const action: input.Action = if (repeat) .repeat else .press;
+                        const scancode = scancodeFromLparam(lParam);
+                        const key = keyFromScancode(scancode);
+                        const mods = getModifiers();
+
+                        // Save for WM_CHAR pairing
+                        s.pending_key = .{ .key = key, .mods = mods, .action = action };
+
+                        // Check if TranslateMessage already posted a WM_CHAR.
+                        // If so, let WM_CHAR handle the event with utf8 text.
+                        var peek: win32.MSG = undefined;
+                        if (win32.PeekMessageW(&peek, hwnd, win32.WM_CHAR, win32.WM_CHAR, win32.PM_NOREMOVE) != 0) {
+                            return 0;
+                        }
+                        // Also check for WM_SYSCHAR (Alt+key)
+                        if (win32.PeekMessageW(&peek, hwnd, win32.WM_SYSCHAR, win32.WM_SYSCHAR, win32.PM_NOREMOVE) != 0) {
+                            return 0;
+                        }
+
+                        // No WM_CHAR coming: send key event without text
+                        if (s.core_surface) |*cs| {
+                            _ = cs.keyCallback(.{
+                                .action = action,
+                                .key = key,
+                                .mods = mods,
+                            }) catch |err| {
+                                log.warn("keyCallback error: {}", .{err});
+                            };
+                        }
+                        s.pending_key = null;
+                    }
+                }
+                return 0;
+            },
+            win32.WM_CHAR,
+            win32.WM_SYSCHAR,
+            => {
+                if (app) |a| {
+                    if (a.surface) |*s| {
+                        if (s.core_surface) |*cs| {
+                            const codepoint: u21 = std.math.cast(u21, wParam) orelse 0;
+                            // Skip control characters except for direct terminal input
+                            if (codepoint >= 32 or codepoint == '\t' or codepoint == '\r' or codepoint == '\n' or codepoint == 0x1b or codepoint == 0x08) {
+                                var utf8_buf: [4]u8 = undefined;
+                                const utf8 = utf16ToUtf8(codepoint, &utf8_buf);
+                                const pending: Surface.PendingKey = s.pending_key orelse .{};
+                                s.pending_key = null;
+
+                                _ = cs.keyCallback(.{
+                                    .action = pending.action,
+                                    .key = pending.key,
+                                    .mods = pending.mods,
+                                    .utf8 = utf8,
+                                }) catch |err| {
+                                    log.warn("keyCallback error: {}", .{err});
+                                };
+                            }
+                        }
+                    }
+                }
+                return 0;
+            },
+            win32.WM_KEYUP,
+            win32.WM_SYSKEYUP,
+            => {
+                if (app) |a| {
+                    if (a.surface) |*s| {
+                        if (s.core_surface) |*cs| {
+                            const scancode = scancodeFromLparam(lParam);
+                            const key = keyFromScancode(scancode);
+                            const mods = getModifiers();
+
+                            _ = cs.keyCallback(.{
+                                .action = .release,
+                                .key = key,
+                                .mods = mods,
+                            }) catch |err| {
+                                log.warn("keyCallback error: {}", .{err});
+                            };
+                        }
+                    }
+                }
+                return 0;
+            },
             win32.WM_USER => {
-                // Wakeup: process core app mailbox
                 if (app) |a| {
                     a.core_app.tick(a) catch |err| {
                         log.warn("tick error: {}", .{err});
@@ -535,6 +711,15 @@ pub const Surface = struct {
     size: apprt.SurfaceSize = .{ .width = 800, .height = 600 },
     cursor_pos: apprt.CursorPos = .{ .x = 0, .y = 0 },
     title: ?[:0]const u8 = null,
+
+    /// Pending key info from WM_KEYDOWN, consumed by WM_CHAR.
+    pending_key: ?PendingKey = null,
+
+    const PendingKey = struct {
+        key: input.Key = .unidentified,
+        mods: input.Mods = .{},
+        action: input.Action = .press,
+    };
 
     pub fn init(self: *Surface, app: *App) !void {
         self.app = app;
