@@ -169,6 +169,9 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         apprt.gtk,
         => try prepareContext(null),
 
+        // Windows: GL context is already current, load via GLAD global loader.
+        apprt.windows => try prepareContext(null),
+
         apprt.embedded => {
             // TODO(mitchellh): this does nothing today to allow libghostty
             // to compile for OpenGL targets but libghostty is strictly
@@ -190,13 +193,19 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 /// thread for final main thread setup requirements.
 pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
+
+    switch (apprt.runtime) {
+        // Windows: release GL context from main thread so renderer thread
+        // can acquire it.
+        apprt.windows => surface.glReleaseContext(),
+
+        else => {},
+    }
 }
 
 /// Callback called by renderer.Thread when it begins.
 pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
 
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
@@ -206,6 +215,12 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
             // tell, so we use the renderer thread to setup all the state
             // but then do the actual draws and texture syncs and all that
             // on the main thread. As such, we don't do anything here.
+        },
+
+        // Windows: acquire GL context on renderer thread and re-load GLAD.
+        apprt.windows => {
+            surface.glMakeContextCurrent();
+            try prepareContext(null);
         },
 
         apprt.embedded => {
@@ -227,6 +242,9 @@ pub fn threadExit(self: *const OpenGL) void {
             // We don't need to do any unloading for GTK because we may
             // be sharing the global bindings with other windows.
         },
+
+        // Windows: release GL context from renderer thread.
+        apprt.windows => apprt.windows.glReleaseCurrentContext(),
 
         apprt.embedded => {
             // TODO: see threadEnter
@@ -257,10 +275,13 @@ pub fn drawFrameStart(self: *OpenGL) void {
 }
 
 /// Actions taken after `drawFrame` is done.
-///
-/// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameEnd(self: *OpenGL) void {
     _ = self;
+
+    // Windows: swap buffers to display the rendered frame.
+    if (comptime apprt.runtime == apprt.windows) {
+        apprt.windows.swapCurrentBuffers();
+    }
 }
 
 pub fn initShaders(

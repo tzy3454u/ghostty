@@ -1,18 +1,43 @@
 //! Application runtime for Windows using the native Win32 API.
-//! This creates a window with an OpenGL 4.3 core profile context
-//! and runs a Win32 message loop.
+//! This creates a window with an OpenGL 4.3 core profile context,
+//! connects to Ghostty's renderer and terminal IO, and runs a
+//! Win32 message loop.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const apprt = @import("../apprt.zig");
+const configpkg = @import("../config.zig");
+const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const CoreApp = @import("../App.zig");
+const CoreSurface = @import("../Surface.zig");
 
 pub const resourcesDir = internal_os.resourcesDir;
 
 const log = std.log.scoped(.windows_app);
+
+// ---------------------------------------------------------------
+// Module-level helper functions called from renderer (OpenGL.zig)
+// ---------------------------------------------------------------
+
+/// Swap the back buffer of the current WGL context.
+/// Called from OpenGL.drawFrameEnd on the renderer thread.
+pub fn swapCurrentBuffers() void {
+    const hdc = win32.wglGetCurrentDC();
+    if (hdc) |dc| _ = win32.SwapBuffers(dc);
+}
+
+/// Release the current WGL context (make no context current).
+/// Called from OpenGL.threadExit on the renderer thread.
+pub fn glReleaseCurrentContext() void {
+    _ = win32.wglMakeCurrent(null, null);
+}
+
+// ---------------------------------------------------------------
+// Win32 API bindings
+// ---------------------------------------------------------------
 
 const win32 = struct {
     const HINSTANCE = std.os.windows.HINSTANCE;
@@ -46,14 +71,6 @@ const win32 = struct {
         lParam: LPARAM,
         time: DWORD,
         pt: POINT,
-    };
-    const PAINTSTRUCT = extern struct {
-        hdc: HDC,
-        fErase: BOOL,
-        rcPaint: RECT,
-        fRestore: BOOL,
-        fIncUpdate: BOOL,
-        rgbReserved: [32]u8,
     };
     const WNDCLASSEXW = extern struct {
         cbSize: u32,
@@ -102,7 +119,7 @@ const win32 = struct {
     const WM_DESTROY = 0x0002;
     const WM_SIZE = 0x0005;
     const WM_PAINT = 0x000F;
-    const WM_NCCREATE = 0x0081;
+    const WM_USER = 0x0400;
 
     // Window style constants
     const WS_OVERLAPPEDWINDOW = 0x00CF0000;
@@ -113,7 +130,6 @@ const win32 = struct {
     const CS_HREDRAW = 0x0002;
     const CS_VREDRAW = 0x0001;
     const CS_OWNDC = 0x0020;
-    const COLOR_WINDOW = 5;
     const IDC_ARROW = @as(LPCWSTR, @ptrFromInt(32512));
 
     // SetWindowLongPtr index
@@ -131,9 +147,6 @@ const win32 = struct {
     const WGL_CONTEXT_MINOR_VERSION_ARB = 0x2092;
     const WGL_CONTEXT_PROFILE_MASK_ARB = 0x9126;
     const WGL_CONTEXT_CORE_PROFILE_BIT_ARB = 0x00000001;
-
-    // OpenGL constants
-    const GL_COLOR_BUFFER_BIT = 0x00004000;
 
     // WGL extension function types
     const WglCreateContextAttribsARB = *const fn (
@@ -160,23 +173,27 @@ const win32 = struct {
     ) callconv(.winapi) ?HWND;
     extern "user32" fn DefWindowProcW(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
     extern "user32" fn GetMessageW(lpMsg: *MSG, hwnd: ?HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) callconv(.winapi) BOOL;
+    extern "user32" fn PeekMessageW(lpMsg: *MSG, hwnd: ?HWND, wMsgFilterMin: u32, wMsgFilterMax: u32, wRemoveMsg: u32) callconv(.winapi) BOOL;
     extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
     extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
     extern "user32" fn PostQuitMessage(nExitCode: i32) callconv(.winapi) void;
+    extern "user32" fn PostMessageW(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) BOOL;
     extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
     extern "user32" fn DestroyWindow(hwnd: HWND) callconv(.winapi) BOOL;
     extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
     extern "user32" fn SetWindowLongPtrW(hwnd: HWND, nIndex: i32, dwNewLong: isize) callconv(.winapi) isize;
     extern "user32" fn GetWindowLongPtrW(hwnd: HWND, nIndex: i32) callconv(.winapi) isize;
     extern "user32" fn ValidateRect(hwnd: HWND, lpRect: ?*const RECT) callconv(.winapi) BOOL;
+    extern "user32" fn InvalidateRect(hwnd: ?HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(.winapi) BOOL;
     extern "user32" fn UnregisterClassW(lpClassName: LPCWSTR, hInstance: ?HINSTANCE) callconv(.winapi) BOOL;
+    extern "user32" fn GetClientRect(hwnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+    extern "user32" fn SetWindowTextW(hwnd: HWND, lpString: LPCWSTR) callconv(.winapi) BOOL;
 
     // kernel32
     extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.winapi) ?HINSTANCE;
     extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 
     // gdi32
-    extern "gdi32" fn GetStockObject(i: i32) callconv(.winapi) ?HBRUSH;
     extern "gdi32" fn ChoosePixelFormat(hdc: HDC, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) i32;
     extern "gdi32" fn SetPixelFormat(hdc: HDC, format: i32, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
     extern "gdi32" fn SwapBuffers(hdc: HDC) callconv(.winapi) BOOL;
@@ -186,9 +203,7 @@ const win32 = struct {
     extern "opengl32" fn wglMakeCurrent(hdc: ?HDC, hglrc: ?HGLRC) callconv(.winapi) BOOL;
     extern "opengl32" fn wglDeleteContext(hglrc: HGLRC) callconv(.winapi) BOOL;
     extern "opengl32" fn wglGetProcAddress(lpszProc: [*:0]const u8) callconv(.winapi) ?*anyopaque;
-    extern "opengl32" fn glClearColor(r: f32, g: f32, b: f32, a: f32) callconv(.winapi) void;
-    extern "opengl32" fn glClear(mask: u32) callconv(.winapi) void;
-    extern "opengl32" fn glViewport(x: i32, y: i32, width: i32, height: i32) callconv(.winapi) void;
+    extern "opengl32" fn wglGetCurrentDC() callconv(.winapi) ?HDC;
 };
 
 /// Standard pixel format descriptor for OpenGL rendering.
@@ -221,16 +236,32 @@ const pfd = win32.PIXELFORMATDESCRIPTOR{
     .dwDamageMask = 0,
 };
 
+// ---------------------------------------------------------------
+// App
+// ---------------------------------------------------------------
+
 pub const App = struct {
     core_app: *CoreApp,
+    config: configpkg.Config,
     hwnd: ?win32.HWND = null,
     hdc: ?win32.HDC = null,
     hglrc: ?win32.HGLRC = null,
+    surface: ?Surface = null,
 
     pub const Options = struct {};
 
     pub fn init(self: *App, core_app: *CoreApp, _: Options) !void {
-        self.* = .{ .core_app = core_app };
+        const alloc = core_app.alloc;
+
+        // Load configuration
+        var config = try configpkg.Config.load(alloc);
+        errdefer config.deinit();
+        try config.finalize();
+
+        self.* = .{
+            .core_app = core_app,
+            .config = config,
+        };
 
         const hInstance = win32.GetModuleHandleW(null);
         const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
@@ -272,7 +303,6 @@ pub const App = struct {
 
         if (hwnd) |h| {
             self.hwnd = h;
-            // Store self pointer in window user data so wndProc can access it
             _ = win32.SetWindowLongPtrW(h, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
             log.info("Window created successfully", .{});
         } else {
@@ -281,16 +311,96 @@ pub const App = struct {
         }
 
         try self.initOpenGL();
+
+        // Create the primary surface (terminal)
+        self.surface = .{};
+        try self.surface.?.init(self);
     }
 
-    /// Initialize OpenGL context on the window.
-    /// Uses a dummy window to load WGL extensions, then creates an
-    /// OpenGL 4.3 core profile context on the real window.
+    pub fn terminate(self: *App) void {
+        if (self.surface) |*s| {
+            s.deinit();
+            self.surface = null;
+        }
+        if (self.hglrc) |hglrc| {
+            _ = win32.wglMakeCurrent(null, null);
+            _ = win32.wglDeleteContext(hglrc);
+            self.hglrc = null;
+        }
+        if (self.hwnd) |hwnd| {
+            _ = win32.DestroyWindow(hwnd);
+            self.hwnd = null;
+        }
+        self.hdc = null;
+        self.config.deinit();
+    }
+
+    pub fn run(self: *App) !void {
+        log.info("Entering Win32 message loop", .{});
+        var msg: win32.MSG = undefined;
+        while (win32.GetMessageW(&msg, null, 0, 0) != 0) {
+            _ = win32.TranslateMessage(&msg);
+            _ = win32.DispatchMessageW(&msg);
+        }
+        log.info("Message loop exited", .{});
+        _ = self;
+    }
+
+    /// Wake up the event loop from any thread.
+    pub fn wakeup(self: *const App) void {
+        if (self.hwnd) |hwnd| {
+            _ = win32.PostMessageW(hwnd, win32.WM_USER, 0, 0);
+        }
+    }
+
+    pub fn keyboardLayout(_: *const App) input.KeyboardLayout {
+        return .unknown;
+    }
+
+    pub fn performAction(
+        self: *App,
+        target: apprt.Target,
+        comptime action: apprt.Action.Key,
+        value: apprt.Action.Value(action),
+    ) !bool {
+        _ = target;
+        switch (action) {
+            .quit => {
+                if (self.hwnd) |hwnd| _ = win32.DestroyWindow(hwnd);
+                return true;
+            },
+            .set_title => {
+                if (self.hwnd) |hwnd| {
+                    const title = value.title;
+                    // Convert UTF-8 title to UTF-16 for SetWindowTextW
+                    var buf: [512]u16 = undefined;
+                    const len = std.unicode.utf8ToUtf16Le(&buf, title) catch 0;
+                    if (len < buf.len) {
+                        buf[len] = 0;
+                        _ = win32.SetWindowTextW(hwnd, @ptrCast(&buf));
+                    }
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    pub fn performIpc(
+        _: Allocator,
+        _: apprt.ipc.Target,
+        comptime action: apprt.ipc.Action.Key,
+        _: apprt.ipc.Action.Value(action),
+    ) !bool {
+        return false;
+    }
+
+    /// Initialize OpenGL 4.3 core profile context using WGL.
     fn initOpenGL(self: *App) !void {
         const hwnd = self.hwnd orelse return error.NoWindow;
         const hInstance = win32.GetModuleHandleW(null);
 
-        // --- Phase 1: Create dummy window to load WGL extensions ---
+        // --- Phase 1: Dummy window to load WGL extensions ---
         const dummy_class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyDummyGL");
         const dummy_wc = win32.WNDCLASSEXW{
             .cbSize = @sizeOf(win32.WNDCLASSEXW),
@@ -307,40 +417,22 @@ pub const App = struct {
             .hIconSm = null,
         };
 
-        if (win32.RegisterClassExW(&dummy_wc) == 0) {
-            log.err("Failed to register dummy GL class", .{});
-            return error.DummyClassRegistrationFailed;
-        }
+        if (win32.RegisterClassExW(&dummy_wc) == 0) return error.DummyClassRegistrationFailed;
 
         const dummy_hwnd = win32.CreateWindowExW(
-            0,
-            dummy_class_name,
-            std.unicode.utf8ToUtf16LeStringLiteral(""),
-            0, // invisible
-            0, 0, 1, 1,
-            null, null, hInstance, null,
-        ) orelse {
-            log.err("Failed to create dummy GL window", .{});
-            return error.DummyWindowCreationFailed;
-        };
+            0, dummy_class_name, std.unicode.utf8ToUtf16LeStringLiteral(""), 0,
+            0, 0, 1, 1, null, null, hInstance, null,
+        ) orelse return error.DummyWindowCreationFailed;
 
         const dummy_hdc = win32.GetDC(dummy_hwnd) orelse {
             _ = win32.DestroyWindow(dummy_hwnd);
             return error.GetDCFailed;
         };
 
-        // Set pixel format on dummy
         const dummy_pf = win32.ChoosePixelFormat(dummy_hdc, &pfd);
-        if (dummy_pf == 0) {
-            _ = win32.DestroyWindow(dummy_hwnd);
-            return error.ChoosePixelFormatFailed;
-        }
-        if (win32.SetPixelFormat(dummy_hdc, dummy_pf, &pfd) == 0) {
-            _ = win32.DestroyWindow(dummy_hwnd);
-            return error.SetPixelFormatFailed;
-        }
+        if (dummy_pf == 0) { _ = win32.DestroyWindow(dummy_hwnd); return error.ChoosePixelFormatFailed; }
+        if (win32.SetPixelFormat(dummy_hdc, dummy_pf, &pfd) == 0) { _ = win32.DestroyWindow(dummy_hwnd); return error.SetPixelFormatFailed; }
 
-        // Create legacy context on dummy
         const dummy_ctx = win32.wglCreateContext(dummy_hdc) orelse {
             _ = win32.DestroyWindow(dummy_hwnd);
             return error.LegacyContextCreationFailed;
@@ -351,97 +443,39 @@ pub const App = struct {
             return error.MakeCurrentFailed;
         }
 
-        // Load wglCreateContextAttribsARB
         const wglCreateContextAttribsARB: ?win32.WglCreateContextAttribsARB = @ptrCast(
             win32.wglGetProcAddress("wglCreateContextAttribsARB"),
         );
 
-        // Clean up dummy
         _ = win32.wglMakeCurrent(null, null);
         _ = win32.wglDeleteContext(dummy_ctx);
         _ = win32.DestroyWindow(dummy_hwnd);
         _ = win32.UnregisterClassW(dummy_class_name, hInstance);
 
-        // --- Phase 2: Create real OpenGL context ---
+        // --- Phase 2: Real OpenGL context ---
         const hdc = win32.GetDC(hwnd) orelse return error.GetDCFailed;
         self.hdc = hdc;
 
         const pixel_format = win32.ChoosePixelFormat(hdc, &pfd);
-        if (pixel_format == 0) {
-            log.err("Failed to choose pixel format, error={}", .{win32.GetLastError()});
-            return error.ChoosePixelFormatFailed;
-        }
-        if (win32.SetPixelFormat(hdc, pixel_format, &pfd) == 0) {
-            log.err("Failed to set pixel format, error={}", .{win32.GetLastError()});
-            return error.SetPixelFormatFailed;
-        }
+        if (pixel_format == 0) return error.ChoosePixelFormatFailed;
+        if (win32.SetPixelFormat(hdc, pixel_format, &pfd) == 0) return error.SetPixelFormatFailed;
         log.info("Pixel format set: {}", .{pixel_format});
 
-        // Create OpenGL 4.3 core profile context
         if (wglCreateContextAttribsARB) |createCtxARB| {
             const attribs = [_:0]i32{
                 win32.WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
                 win32.WGL_CONTEXT_MINOR_VERSION_ARB, 3,
                 win32.WGL_CONTEXT_PROFILE_MASK_ARB,  win32.WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
             };
-            const ctx = createCtxARB(hdc, null, &attribs) orelse {
-                log.err("wglCreateContextAttribsARB failed, error={}", .{win32.GetLastError()});
-                return error.OpenGLContextCreationFailed;
-            };
-            self.hglrc = ctx;
+            self.hglrc = createCtxARB(hdc, null, &attribs) orelse return error.OpenGLContextCreationFailed;
             log.info("Created OpenGL 4.3 core profile context", .{});
         } else {
-            // Fallback to legacy context (compatibility profile)
             log.warn("wglCreateContextAttribsARB not available, using legacy context", .{});
-            const ctx = win32.wglCreateContext(hdc) orelse {
-                return error.OpenGLContextCreationFailed;
-            };
-            self.hglrc = ctx;
+            self.hglrc = win32.wglCreateContext(hdc) orelse return error.OpenGLContextCreationFailed;
         }
 
-        if (win32.wglMakeCurrent(hdc, self.hglrc) == 0) {
-            log.err("wglMakeCurrent failed, error={}", .{win32.GetLastError()});
-            return error.MakeCurrentFailed;
-        }
-
-        // Draw initial frame to confirm OpenGL works
-        win32.glClearColor(0.18, 0.0, 0.30, 1.0);
-        win32.glClear(win32.GL_COLOR_BUFFER_BIT);
-        _ = win32.SwapBuffers(hdc);
-        log.info("OpenGL context initialized and first frame rendered", .{});
-    }
-
-    pub fn terminate(self: *App) void {
-        if (self.hglrc) |hglrc| {
-            _ = win32.wglMakeCurrent(null, null);
-            _ = win32.wglDeleteContext(hglrc);
-            self.hglrc = null;
-        }
-        if (self.hwnd) |hwnd| {
-            _ = win32.DestroyWindow(hwnd);
-            self.hwnd = null;
-        }
-        self.hdc = null;
-    }
-
-    pub fn run(self: *App) !void {
-        _ = self;
-        log.info("Entering Win32 message loop", .{});
-        var msg: win32.MSG = undefined;
-        while (win32.GetMessageW(&msg, null, 0, 0) != 0) {
-            _ = win32.TranslateMessage(&msg);
-            _ = win32.DispatchMessageW(&msg);
-        }
-        log.info("Message loop exited", .{});
-    }
-
-    pub fn performIpc(
-        _: Allocator,
-        _: apprt.ipc.Target,
-        comptime action: apprt.ipc.Action.Key,
-        _: apprt.ipc.Action.Value(action),
-    ) !bool {
-        return false;
+        if (win32.wglMakeCurrent(hdc, self.hglrc) == 0) return error.MakeCurrentFailed;
+        log.info("OpenGL context initialized", .{});
     }
 
     fn wndProc(hwnd: win32.HWND, msg: u32, wParam: win32.WPARAM, lParam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
@@ -456,22 +490,34 @@ pub const App = struct {
                 return 0;
             },
             win32.WM_PAINT => {
-                if (app) |a| {
-                    if (a.hdc) |hdc| {
-                        win32.glClearColor(0.18, 0.0, 0.30, 1.0);
-                        win32.glClear(win32.GL_COLOR_BUFFER_BIT);
-                        _ = win32.SwapBuffers(hdc);
-                    }
-                }
+                // The renderer thread handles all GL drawing via SwapBuffers.
+                // We just validate the rect to prevent WM_PAINT storms.
                 _ = win32.ValidateRect(hwnd, null);
                 return 0;
             },
             win32.WM_SIZE => {
-                // lParam: LOWORD = width, HIWORD = height
-                const lparam: usize = @bitCast(lParam);
-                const width: i32 = @intCast(lparam & 0xFFFF);
-                const height: i32 = @intCast((lparam >> 16) & 0xFFFF);
-                win32.glViewport(0, 0, width, height);
+                if (app) |a| {
+                    if (a.surface) |*s| {
+                        const lparam: usize = @bitCast(lParam);
+                        const width: u32 = @truncate(lparam & 0xFFFF);
+                        const height: u32 = @truncate((lparam >> 16) & 0xFFFF);
+                        s.size = .{ .width = width, .height = height };
+                        if (s.core_surface) |*cs| {
+                            cs.sizeCallback(.{ .width = width, .height = height }) catch |err| {
+                                log.warn("sizeCallback error: {}", .{err});
+                            };
+                        }
+                    }
+                }
+                return 0;
+            },
+            win32.WM_USER => {
+                // Wakeup: process core app mailbox
+                if (app) |a| {
+                    a.core_app.tick(a) catch |err| {
+                        log.warn("tick error: {}", .{err});
+                    };
+                }
                 return 0;
             },
             else => return win32.DefWindowProcW(hwnd, msg, wParam, lParam),
@@ -479,8 +525,133 @@ pub const App = struct {
     }
 };
 
+// ---------------------------------------------------------------
+// Surface
+// ---------------------------------------------------------------
+
 pub const Surface = struct {
+    app: *App = undefined,
+    core_surface: ?CoreSurface = null,
+    size: apprt.SurfaceSize = .{ .width = 800, .height = 600 },
+    cursor_pos: apprt.CursorPos = .{ .x = 0, .y = 0 },
+    title: ?[:0]const u8 = null,
+
+    pub fn init(self: *Surface, app: *App) !void {
+        self.app = app;
+
+        // Get the actual client area size
+        if (app.hwnd) |hwnd| {
+            var rect: win32.RECT = undefined;
+            if (win32.GetClientRect(hwnd, &rect) != 0) {
+                self.size = .{
+                    .width = @intCast(rect.right - rect.left),
+                    .height = @intCast(rect.bottom - rect.top),
+                };
+            }
+        }
+
+        // Register with the core app
+        try app.core_app.addSurface(self);
+        errdefer app.core_app.deleteSurface(self);
+
+        // Initialize the core surface (this starts renderer + IO threads)
+        self.core_surface = undefined;
+        try self.core_surface.?.init(
+            app.core_app.alloc,
+            &app.config,
+            app.core_app,
+            app,
+            self,
+        );
+    }
+
     pub fn deinit(self: *Surface) void {
-        _ = self;
+        if (self.core_surface) |*cs| {
+            cs.deinit();
+            self.core_surface = null;
+        }
+        self.app.core_app.deleteSurface(self);
+    }
+
+    /// Get the core surface pointer (required by the apprt interface).
+    pub fn core(self: *Surface) *CoreSurface {
+        return &self.core_surface.?;
+    }
+
+    /// Get the runtime App pointer.
+    pub fn rtApp(self: *Surface) *App {
+        return self.app;
+    }
+
+    /// Content scale (DPI ratio). 1.0 = 96 DPI (standard).
+    pub fn getContentScale(_: *Surface) !apprt.ContentScale {
+        // TODO: detect actual DPI from GetDpiForWindow
+        return .{ .x = 1.0, .y = 1.0 };
+    }
+
+    /// Get the surface size in pixels.
+    pub fn getSize(self: *Surface) !apprt.SurfaceSize {
+        return self.size;
+    }
+
+    /// Get the window title.
+    pub fn getTitle(self: *Surface) ?[:0]const u8 {
+        return self.title;
+    }
+
+    /// Get the cursor position in surface coordinates.
+    pub fn getCursorPos(self: *Surface) !apprt.CursorPos {
+        return self.cursor_pos;
+    }
+
+    /// Get default environment variables for terminal IO.
+    pub fn defaultTermioEnv(self: *Surface) !std.process.EnvMap {
+        return internal_os.getEnvMap(self.app.core_app.alloc);
+    }
+
+    /// Close the surface.
+    pub fn close(self: *Surface, process_active: bool) void {
+        _ = process_active;
+        if (self.app.hwnd) |hwnd| {
+            _ = win32.DestroyWindow(hwnd);
+        }
+    }
+
+    pub fn supportsClipboard(_: *Surface, clipboard_type: apprt.Clipboard) bool {
+        return clipboard_type == .standard;
+    }
+
+    pub fn setClipboard(
+        _: *Surface,
+        _: apprt.Clipboard,
+        _: []const apprt.ClipboardContent,
+        _: bool,
+    ) !void {
+        // TODO: implement clipboard write via Win32 API
+    }
+
+    pub fn clipboardRequest(
+        _: *Surface,
+        _: apprt.Clipboard,
+        _: apprt.ClipboardRequest,
+    ) !bool {
+        // TODO: implement clipboard read via Win32 API
+        return false;
+    }
+
+    // ---- GL context helpers (called from OpenGL.zig) ----
+
+    /// Make the GL context current on the calling thread.
+    pub fn glMakeContextCurrent(self: *Surface) void {
+        if (self.app.hdc) |hdc| {
+            if (self.app.hglrc) |hglrc| {
+                _ = win32.wglMakeCurrent(hdc, hglrc);
+            }
+        }
+    }
+
+    /// Release the GL context from the calling thread.
+    pub fn glReleaseContext(_: *Surface) void {
+        _ = win32.wglMakeCurrent(null, null);
     }
 };
