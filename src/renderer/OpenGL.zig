@@ -268,10 +268,16 @@ pub fn displayRealized(self: *const OpenGL) void {
 }
 
 /// Actions taken before doing anything in `drawFrame`.
-///
-/// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameStart(self: *OpenGL) void {
     _ = self;
+
+    // Windows: update the GL viewport to match the current window size.
+    // GTK handles this automatically via GtkGLArea, but on Win32 we must
+    // call glViewport ourselves so that surfaceSize() returns the correct
+    // dimensions after a window resize.
+    if (comptime apprt.runtime == apprt.windows) {
+        apprt.windows.updateViewport();
+    }
 }
 
 /// Actions taken after `drawFrame` is done.

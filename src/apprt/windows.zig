@@ -30,6 +30,18 @@ pub fn swapCurrentBuffers() void {
     if (hdc) |dc| _ = win32.SwapBuffers(dc);
 }
 
+/// Update the OpenGL viewport to match the current window client area.
+/// Called from OpenGL.drawFrameStart on the renderer thread.
+pub fn updateViewport() void {
+    const hdc = win32.wglGetCurrentDC() orelse return;
+    const hwnd = win32.WindowFromDC(hdc) orelse return;
+    var rect: win32.RECT = undefined;
+    if (win32.GetClientRect(hwnd, &rect) != 0) {
+        const gl = @import("opengl");
+        gl.glad.context.Viewport.?(0, 0, rect.right - rect.left, rect.bottom - rect.top);
+    }
+}
+
 /// Release the current WGL context (make no context current).
 /// Called from OpenGL.threadExit on the renderer thread.
 pub fn glReleaseCurrentContext() void {
@@ -227,6 +239,7 @@ const win32 = struct {
     extern "gdi32" fn ChoosePixelFormat(hdc: HDC, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) i32;
     extern "gdi32" fn SetPixelFormat(hdc: HDC, format: i32, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
     extern "gdi32" fn SwapBuffers(hdc: HDC) callconv(.winapi) BOOL;
+    extern "gdi32" fn WindowFromDC(hdc: HDC) callconv(.winapi) ?HWND;
 
     // opengl32
     extern "opengl32" fn wglCreateContext(hdc: HDC) callconv(.winapi) ?HGLRC;
