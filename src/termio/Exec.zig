@@ -251,8 +251,11 @@ pub fn focusGained(
         // only do this if it isn't already running. We use the termios
         // callback because that'll trigger an immediate state check AND
         // start the timer.
-        if (execdata.termios_timer_c.state() != .active) {
-            _ = termiosTimer(td, undefined, undefined, {});
+        // TODO: implement termios timer on Windows
+        if (comptime builtin.os.tag != .windows) {
+            if (execdata.termios_timer_c.state() != .active) {
+                _ = termiosTimer(td, undefined, undefined, {});
+            }
         }
     }
 }
