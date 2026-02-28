@@ -1,14 +1,54 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
 #include <errno.h>
 #include <zlib.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 
 #define SEPARATOR '\x01'
 #define CHUNK_SIZE 16384
 
+#ifdef _WIN32
+/* Windows: scan directory for .txt files using FindFirstFileA/FindNextFileA */
+static int scandir_txt(const char *dir, char ***out_names) {
+    char pattern[4096];
+    snprintf(pattern, sizeof(pattern), "%s\\*.txt", dir);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+
+    int capacity = 64;
+    int count = 0;
+    char **names = malloc(capacity * sizeof(char*));
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (count >= capacity) {
+            capacity *= 2;
+            names = realloc(names, capacity * sizeof(char*));
+        }
+        names[count++] = strdup(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    /* sort alphabetically */
+    for (int i = 0; i < count - 1; i++)
+        for (int j = i + 1; j < count; j++)
+            if (strcmp(names[i], names[j]) > 0) {
+                char *tmp = names[i]; names[i] = names[j]; names[j] = tmp;
+            }
+
+    *out_names = names;
+    return count;
+}
+#else
 static int filter_frames(const struct dirent *entry) {
     const char *name = entry->d_name;
     size_t len = strlen(name);
@@ -18,6 +58,7 @@ static int filter_frames(const struct dirent *entry) {
 static int compare_frames(const struct dirent **a, const struct dirent **b) {
     return strcmp((*a)->d_name, (*b)->d_name);
 }
+#endif
 
 static char *read_file(const char *path, size_t *out_size) {
     FILE *f = fopen(path, "rb");
@@ -54,8 +95,13 @@ int main(int argc, char **argv) {
     const char *frames_dir = argv[1];
     const char *output_file = argv[2];
 
+#ifdef _WIN32
+    char **namelist;
+    int n = scandir_txt(frames_dir, &namelist);
+#else
     struct dirent **namelist;
     int n = scandir(frames_dir, &namelist, filter_frames, compare_frames);
+#endif
     if (n < 0) {
         fprintf(stderr, "Failed to scan directory %s: %s\n", frames_dir, strerror(errno));
         return 1;
@@ -72,7 +118,11 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < n; i++) {
         char path[4096];
+#ifdef _WIN32
+        snprintf(path, sizeof(path), "%s/%s", frames_dir, namelist[i]);
+#else
         snprintf(path, sizeof(path), "%s/%s", frames_dir, namelist[i]->d_name);
+#endif
         
         frame_contents[i] = read_file(path, &frame_sizes[i]);
         if (!frame_contents[i]) {

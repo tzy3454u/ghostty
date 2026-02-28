@@ -6,6 +6,7 @@
 const CodepointWidth = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Benchmark = @import("Benchmark.zig");
@@ -101,7 +102,14 @@ fn stepNoop(ptr: *anyopaque) Benchmark.Error!void {
     _ = ptr;
 }
 
-extern "c" fn wcwidth(c: u32) c_int;
+const wcwidth = if (builtin.os.tag == .windows)
+    struct {
+        fn f(_: u32) c_int {
+            return 1; // stub: wcwidth not available on Windows
+        }
+    }.f
+else
+    @extern(*const fn (u32) callconv(.c) c_int, .{ .name = "wcwidth" });
 
 fn stepWcwidth(ptr: *anyopaque) Benchmark.Error!void {
     const self: *CodepointWidth = @ptrCast(@alignCast(ptr));
