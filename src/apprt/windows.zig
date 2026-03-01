@@ -260,6 +260,28 @@ const win32 = struct {
     extern "opengl32" fn wglDeleteContext(hglrc: HGLRC) callconv(.winapi) BOOL;
     extern "opengl32" fn wglGetProcAddress(lpszProc: [*:0]const u8) callconv(.winapi) ?*anyopaque;
     extern "opengl32" fn wglGetCurrentDC() callconv(.winapi) ?HDC;
+
+    // Clipboard types
+    const HANDLE = *anyopaque;
+    const HGLOBAL = HANDLE;
+
+    // Clipboard constants
+    const CF_UNICODETEXT: u32 = 13;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+
+    // user32 clipboard functions
+    extern "user32" fn OpenClipboard(hWndNewOwner: ?HWND) callconv(.winapi) BOOL;
+    extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
+    extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
+    extern "user32" fn SetClipboardData(uFormat: u32, hMem: ?HGLOBAL) callconv(.winapi) ?HGLOBAL;
+    extern "user32" fn GetClipboardData(uFormat: u32) callconv(.winapi) ?HGLOBAL;
+    extern "user32" fn IsClipboardFormatAvailable(format: u32) callconv(.winapi) BOOL;
+
+    // kernel32 global memory functions (required for clipboard data)
+    extern "kernel32" fn GlobalAlloc(uFlags: u32, dwBytes: usize) callconv(.winapi) ?HGLOBAL;
+    extern "kernel32" fn GlobalFree(hMem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
+    extern "kernel32" fn GlobalLock(hMem: HGLOBAL) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GlobalUnlock(hMem: HGLOBAL) callconv(.winapi) BOOL;
 };
 
 /// Standard pixel format descriptor for OpenGL rendering.
@@ -1273,21 +1295,82 @@ pub const Surface = struct {
     }
 
     pub fn setClipboard(
-        _: *Surface,
+        self: *Surface,
         _: apprt.Clipboard,
-        _: []const apprt.ClipboardContent,
+        contents: []const apprt.ClipboardContent,
         _: bool,
     ) !void {
-        // TODO: implement clipboard write via Win32 API
+        // Find the first text/plain content to write
+        var text: ?[:0]const u8 = null;
+        for (contents) |content| {
+            if (std.mem.eql(u8, content.mime, "text/plain") or
+                std.mem.startsWith(u8, content.mime, "text/plain;"))
+            {
+                text = content.data;
+                break;
+            }
+        }
+        const utf8 = text orelse return;
+
+        // Convert UTF-8 → UTF-16LE for CF_UNICODETEXT
+        const utf16 = try std.unicode.utf8ToUtf16LeAlloc(self.app.alloc, utf8);
+        defer self.app.alloc.free(utf16);
+
+        // Allocate global memory (OS takes ownership on success)
+        const byte_count = (utf16.len + 1) * @sizeOf(u16); // +1 for null terminator
+        const hmem = win32.GlobalAlloc(win32.GMEM_MOVEABLE, byte_count) orelse
+            return error.OutOfMemory;
+
+        const raw_ptr = win32.GlobalLock(hmem) orelse {
+            _ = win32.GlobalFree(hmem);
+            return error.OutOfMemory;
+        };
+        const dst: [*]u16 = @alignCast(@ptrCast(raw_ptr));
+        @memcpy(dst[0..utf16.len], utf16);
+        dst[utf16.len] = 0;
+        _ = win32.GlobalUnlock(hmem);
+
+        if (win32.OpenClipboard(null) == 0) {
+            _ = win32.GlobalFree(hmem);
+            return error.ClipboardOpenFailed;
+        }
+        _ = win32.EmptyClipboard();
+        if (win32.SetClipboardData(win32.CF_UNICODETEXT, hmem) == null) {
+            // OS did not take ownership; we must free
+            _ = win32.GlobalFree(hmem);
+            _ = win32.CloseClipboard();
+            return error.ClipboardSetFailed;
+        }
+        // On success the OS owns hmem — do NOT free it
+        _ = win32.CloseClipboard();
     }
 
     pub fn clipboardRequest(
-        _: *Surface,
+        self: *Surface,
         _: apprt.Clipboard,
-        _: apprt.ClipboardRequest,
+        state: apprt.ClipboardRequest,
     ) !bool {
-        // TODO: implement clipboard read via Win32 API
-        return false;
+        // Bail early if clipboard does not contain Unicode text
+        if (win32.IsClipboardFormatAvailable(win32.CF_UNICODETEXT) == 0) return false;
+
+        if (win32.OpenClipboard(null) == 0) return false;
+        defer _ = win32.CloseClipboard();
+
+        const hmem = win32.GetClipboardData(win32.CF_UNICODETEXT) orelse return false;
+        const raw_ptr = win32.GlobalLock(hmem) orelse return false;
+        defer _ = win32.GlobalUnlock(hmem);
+
+        // Determine null-terminated UTF-16 length
+        const wptr: [*:0]const u16 = @alignCast(@ptrCast(raw_ptr));
+        var wlen: usize = 0;
+        while (wptr[wlen] != 0) wlen += 1;
+
+        // Convert UTF-16LE → UTF-8 (null-terminated)
+        const utf8z = try std.unicode.utf16LeToUtf8AllocZ(self.app.alloc, wptr[0..wlen]);
+        defer self.app.alloc.free(utf8z);
+
+        try self.core_surface.?.completeClipboardRequest(state, utf8z, false);
+        return true;
     }
 
     // ---- GL context helpers (called from OpenGL.zig) ----
