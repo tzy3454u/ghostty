@@ -1016,6 +1016,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Called when we get an updated display ID for our display link.
         pub fn setMacOSDisplayID(self: *Self, id: u32) !void {
+            if (comptime builtin.os.tag != .macos) return;
             if (comptime DisplayLink == void) return;
             const display_link = self.display_link orelse return;
             log.info("updating display link display id={}", .{id});
