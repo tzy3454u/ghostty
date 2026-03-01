@@ -38,6 +38,7 @@ const macos = switch (builtin.os.tag) {
 
 const DisplayLink = switch (builtin.os.tag) {
     .macos => *macos.video.DisplayLink,
+    .windows => *apprt.windows.WindowsVSync,
     else => void,
 };
 
@@ -694,6 +695,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     try macos.video.DisplayLink.createWithActiveCGDisplays()
                 else
                     null,
+                .windows => if (options.config.vsync)
+                    try apprt.windows.WindowsVSync.create(alloc)
+                else
+                    null,
                 else => null,
             };
             errdefer if (display_link) |v| v.release();
@@ -907,11 +912,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // setup the display link. To setup the display link we set our
             // callback and we can start it immediately.
             const display_link = self.display_link orelse return;
-            try display_link.setOutputCallback(
-                xev.Async,
-                &displayLinkCallback,
-                &thr.draw_now,
-            );
+            // The callback setup is platform-specific:
+            // - macOS: passes displayLinkCallback so CVDisplayLink can call it.
+            // - Windows: WindowsVSync stores draw_now directly; callback is unused.
+            switch (comptime builtin.os.tag) {
+                .macos => try display_link.setOutputCallback(
+                    xev.Async,
+                    &displayLinkCallback,
+                    &thr.draw_now,
+                ),
+                .windows => try display_link.setOutputCallback(
+                    xev.Async,
+                    @as(u8, 0), // ignored by WindowsVSync
+                    &thr.draw_now,
+                ),
+                else => {},
+            }
             display_link.start() catch {};
         }
 

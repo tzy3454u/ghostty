@@ -12,6 +12,7 @@ const configpkg = @import("../config.zig");
 const input = @import("../input.zig");
 const keycodes = @import("../input/keycodes.zig");
 const internal_os = @import("../os/main.zig");
+const xev = @import("../global.zig").xev;
 const SplitTree = @import("../datastruct/split_tree.zig").SplitTree;
 const CoreApp = @import("../App.zig");
 const CoreSurface = @import("../Surface.zig");
@@ -26,9 +27,12 @@ const log = std.log.scoped(.windows_app);
 
 /// Swap the back buffer of the current WGL context.
 /// Called from OpenGL.drawFrameEnd on the renderer thread.
+/// Frame pacing is handled by WindowsVSync (draw_now notifications at 60 Hz).
 pub fn swapCurrentBuffers() void {
     const hdc = win32.wglGetCurrentDC();
-    if (hdc) |dc| _ = win32.SwapBuffers(dc);
+    if (hdc) |dc| {
+        _ = win32.SwapBuffers(dc);
+    }
 }
 
 /// Update the OpenGL viewport to match the current window client area.
@@ -204,6 +208,8 @@ const win32 = struct {
         attribList: [*:0]const i32,
     ) callconv(.winapi) ?HGLRC;
 
+    const WglSwapIntervalEXT = *const fn (interval: i32) callconv(.winapi) BOOL;
+
     // user32
     extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.winapi) u16;
     extern "user32" fn CreateWindowExW(
@@ -247,6 +253,51 @@ const win32 = struct {
     // kernel32
     extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.winapi) ?HINSTANCE;
     extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
+    extern "kernel32" fn SetStdHandle(nStdHandle: DWORD, hHandle: ?HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) ?HANDLE;
+    const STD_ERROR_HANDLE: DWORD = @bitCast(@as(i32, -12));
+    const GENERIC_WRITE: DWORD = 0x40000000;
+    const FILE_SHARE_READ: DWORD = 0x00000001;
+    const CREATE_ALWAYS: DWORD = 2;
+    const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
+
+    // kernel32 — synchronization / waitable timers
+    /// CreateEventW: creates a manual-reset event (bManualReset=1, bInitialState=0).
+    extern "kernel32" fn CreateEventW(
+        lpEventAttributes: ?*anyopaque,
+        bManualReset: BOOL,
+        bInitialState: BOOL,
+        lpName: ?LPCWSTR,
+    ) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetEvent(hEvent: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn ResetEvent(hEvent: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+    /// High-resolution waitable timer (Windows 10 1803+).
+    extern "kernel32" fn CreateWaitableTimerExW(
+        lpTimerAttributes: ?*anyopaque,
+        lpTimerName: ?LPCWSTR,
+        dwFlags: DWORD,
+        dwDesiredAccess: DWORD,
+    ) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetWaitableTimer(
+        hTimer: HANDLE,
+        lpDueTime: *const i64,
+        lPeriod: i32,
+        pfnCompletionRoutine: ?*anyopaque,
+        lpArgToCompletionRoutine: ?*anyopaque,
+        fResume: BOOL,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn CancelWaitableTimer(hTimer: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn WaitForMultipleObjects(
+        nCount: DWORD,
+        lpHandles: [*]const HANDLE,
+        bWaitAll: BOOL,
+        dwMilliseconds: DWORD,
+    ) callconv(.winapi) DWORD;
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: DWORD = 0x00000002;
+    const TIMER_ALL_ACCESS: DWORD = 0x1F0003;
+    const WAIT_OBJECT_0: DWORD = 0x00000000;
+    const INFINITE: DWORD = 0xFFFFFFFF;
 
     // gdi32
     extern "gdi32" fn ChoosePixelFormat(hdc: HDC, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) i32;
@@ -366,6 +417,127 @@ fn utf16ToUtf8(codepoint: u21, buf: *[4]u8) []const u8 {
 }
 
 // ---------------------------------------------------------------
+// WindowsVSync — DisplayLink equivalent for Windows
+// ---------------------------------------------------------------
+//
+// Uses a high-resolution waitable timer (Windows 10 1803+) to call
+// draw_now.notify() at the display's refresh rate.  This drives the
+// renderer thread at 60 Hz independently of IO-wakeup events, giving
+// smooth, frame-paced animation identical to macOS DisplayLink.
+//
+// Interface mirrors macOS video.DisplayLink so that generic.zig can
+// use the same loopEnter / loopExit / hasVsync path on both platforms.
+
+pub const WindowsVSync = struct {
+    const Self = @This();
+
+    alloc: Allocator,
+    draw_now: ?*xev.Async = null,
+    stop_event: win32.HANDLE,
+    timer: win32.HANDLE,
+    thread: ?std.Thread = null,
+    running: std.atomic.Value(bool) = .{ .raw = false },
+
+    pub fn create(alloc: Allocator) !*Self {
+        const self = try alloc.create(Self);
+        errdefer alloc.destroy(self);
+
+        // Manual-reset event, initially not signaled — used to stop the thread.
+        const stop_event = win32.CreateEventW(null, 1, 0, null) orelse
+            return error.CreateEventFailed;
+        errdefer _ = win32.CloseHandle(stop_event);
+
+        // High-resolution waitable timer (synchronization timer, no APC).
+        const timer = win32.CreateWaitableTimerExW(
+            null,
+            null,
+            win32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            win32.TIMER_ALL_ACCESS,
+        ) orelse return error.CreateTimerFailed;
+
+        self.* = .{
+            .alloc = alloc,
+            .stop_event = stop_event,
+            .timer = timer,
+        };
+        return self;
+    }
+
+    /// Store the xev.Async handle to notify on each VSync tick.
+    /// The first two parameters mirror the macOS DisplayLink API and are ignored.
+    pub fn setOutputCallback(
+        self: *Self,
+        comptime _: type,
+        _: anytype,
+        draw_now: *xev.Async,
+    ) !void {
+        self.draw_now = draw_now;
+    }
+
+    /// Start the VSync thread at ~60 Hz.
+    pub fn start(self: *Self) !void {
+        if (self.running.swap(true, .acq_rel)) return; // already running
+
+        // 60 Hz: due_time and period in 100-nanosecond units.
+        // Negative due_time = relative from now.
+        const due_time: i64 = -166_667; // ~16.67 ms
+        const period_ms: i32 = 16; // repeating period in milliseconds
+        _ = win32.SetWaitableTimer(self.timer, &due_time, period_ms, null, null, 0);
+
+        self.thread = try std.Thread.spawn(.{}, vsyncThread, .{self});
+        log.info("Windows VSync thread started (60 Hz)", .{});
+    }
+
+    /// Stop the VSync thread and cancel the timer.
+    pub fn stop(self: *Self) !void {
+        if (!self.running.swap(false, .acq_rel)) return; // not running
+
+        // Signal the stop event to unblock WaitForMultipleObjects.
+        _ = win32.SetEvent(self.stop_event);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        _ = win32.ResetEvent(self.stop_event);
+        _ = win32.CancelWaitableTimer(self.timer);
+        log.info("Windows VSync thread stopped", .{});
+    }
+
+    pub fn isRunning(self: *const Self) bool {
+        return self.running.load(.acquire);
+    }
+
+    /// Destroy this object.  Stops the thread if running.
+    pub fn release(self: *Self) void {
+        self.stop() catch {};
+        _ = win32.CloseHandle(self.timer);
+        _ = win32.CloseHandle(self.stop_event);
+        self.alloc.destroy(self);
+    }
+
+    fn vsyncThread(self: *Self) void {
+        const handles = [_]win32.HANDLE{ self.timer, self.stop_event };
+        while (true) {
+            const result = win32.WaitForMultipleObjects(
+                handles.len,
+                &handles,
+                0, // bWaitAll = FALSE
+                win32.INFINITE,
+            );
+            if (result == win32.WAIT_OBJECT_0) {
+                // Timer fired — notify the renderer thread to draw a frame.
+                if (self.draw_now) |dn| {
+                    dn.notify() catch {};
+                }
+            } else {
+                // Stop event (index 1) or error — exit the loop.
+                break;
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------
 // App
 // ---------------------------------------------------------------
 
@@ -379,6 +551,7 @@ pub const App = struct {
     base_hdc: ?win32.HDC = null,
     base_hglrc: ?win32.HGLRC = null,
     wgl_create_ctx: ?win32.WglCreateContextAttribsARB = null,
+    wgl_swap_interval: ?win32.WglSwapIntervalEXT = null,
 
     // Split pane state
     split_tree: Surface.Tree = .empty,
@@ -388,6 +561,13 @@ pub const App = struct {
 
     pub fn init(self: *App, core_app: *CoreApp, _: Options) !void {
         const alloc = core_app.alloc;
+
+        // Redirect stderr to ghostty_debug.log so std.log output is visible.
+        if (win32.CreateFileW(
+            std.unicode.utf8ToUtf16LeStringLiteral("ghostty_debug.log"),
+            win32.GENERIC_WRITE, win32.FILE_SHARE_READ, null,
+            win32.CREATE_ALWAYS, win32.FILE_ATTRIBUTE_NORMAL, null,
+        )) |h| _ = win32.SetStdHandle(win32.STD_ERROR_HANDLE, h);
 
         // Load configuration
         var config = try configpkg.Config.load(alloc);
@@ -699,8 +879,14 @@ pub const App = struct {
             break :blk null;
         };
 
-        // If this is the only surface, quit
+        // If this is the only surface, quit.
+        // Deinit the surface BEFORE destroying the parent window so that
+        // the renderer thread cleanup (threadEnter / wglMakeCurrent) can
+        // still use the valid HDC.  After DestroyWindow the child HDC is
+        // invalidated, causing wglMakeCurrent to fail silently and the
+        // subsequent GLAD reload to panic.
         if (next_handle == null) {
+            surface.deinitSurface();
             if (self.hwnd) |hwnd| _ = win32.DestroyWindow(hwnd);
             return;
         }
@@ -838,6 +1024,7 @@ pub const App = struct {
         }
 
         self.wgl_create_ctx = @ptrCast(win32.wglGetProcAddress("wglCreateContextAttribsARB"));
+        self.wgl_swap_interval = @ptrCast(win32.wglGetProcAddress("wglSwapIntervalEXT"));
 
         _ = win32.wglMakeCurrent(null, null);
         _ = win32.wglDeleteContext(dummy_ctx);
@@ -864,6 +1051,13 @@ pub const App = struct {
         // Briefly make current for GLAD initialization, then release
         if (win32.wglMakeCurrent(hdc, self.base_hglrc) == 0) return error.MakeCurrentFailed;
         log.info("Base OpenGL context initialized", .{});
+
+        // Disable GPU-level VSync: wglSwapIntervalEXT(1) is ignored by DWM
+        // for child windows.  We use DwmFlush() in swapCurrentBuffers instead.
+        if (self.wgl_swap_interval) |swapInterval| {
+            _ = swapInterval(0);
+            log.info("WGL swap interval set to 0 (VSync via DwmFlush)", .{});
+        }
     }
 
     // ---- Main window procedure ----
@@ -1181,6 +1375,12 @@ pub const Surface = struct {
         // GL context to load OpenGL function pointers via GLAD.
         if (win32.wglMakeCurrent(self.hdc.?, self.hglrc.?) == 0) {
             return error.MakeCurrentFailed;
+        }
+
+        // Disable GPU VSync on the per-surface context (same as base context).
+        // VSync is handled by DwmFlush() in swapCurrentBuffers().
+        if (app.wgl_swap_interval) |swapInterval| {
+            _ = swapInterval(0);
         }
 
         // Get child window size
